@@ -38,23 +38,29 @@ public class FixedWindowQuotaService implements QuotaService {
     }
 
     @Override
-    public QuotaDecision tryAcquire(String callerId, long limit) {
+    public QuotaDecision tryAcquire(String callerId, long limit, long cost) {
+        if (cost <= 0) {
+            throw new IllegalArgumentException("配额成本必须为正数，实际：" + cost);
+        }
         Window window = windows.computeIfAbsent(callerId, k -> new Window(clock.getAsLong()));
         long now = clock.getAsLong();
-        // 窗口翻转 + 计数必须原子完成，否则两个并发请求可能同时读到旧窗口的剩余额度
+        // 窗口翻转 + 检查 + 按成本扣减必须在同一把锁内原子完成：
+        // 要么整批扣减 cost，要么一分不扣，杜绝「扣了一部分却放行/拒绝」的错乱账目
         synchronized (window) {
             if (now - window.startMillis >= windowMillis) {
                 window.startMillis = now;
                 window.used = 0;
             }
-            if (window.used >= limit) {
-                return new QuotaDecision(false, window.used, limit,
-                        "配额已用尽：窗口内已使用 " + window.used + "/" + limit
-                                + "（窗口长度 " + windowMillis + "ms）");
+            if (window.used + cost > limit) {
+                return new QuotaDecision(false, window.used, limit, 0,
+                        "配额不足：本次需消耗 " + cost + "，窗口内已使用 " + window.used
+                                + "/" + limit + "，剩余 " + (limit - window.used)
+                                + "（窗口长度 " + windowMillis + "ms），未扣减任何额度");
             }
-            window.used++;
-            return new QuotaDecision(true, window.used, limit,
-                    "配额内放行：窗口内已使用 " + window.used + "/" + limit);
+            window.used += cost;
+            return new QuotaDecision(true, window.used, limit, cost,
+                    "配额内放行：本次消耗 " + cost + "，窗口内已使用 " + window.used
+                            + "/" + limit + "，剩余 " + (limit - window.used));
         }
     }
 

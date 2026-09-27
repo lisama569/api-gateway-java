@@ -16,10 +16,14 @@ public enum ErrorCode {
     IDENTITY_FORBIDDEN(403),
     /** 身份与权限均有效，但当前时间窗内配额已用尽：过多请求。 */
     QUOTA_EXCEEDED(429),
+    /** 在途并发数达到上限：与配额耗尽不同的过载信号，压力回落后自动恢复。 */
+    CONCURRENCY_LIMIT_EXCEEDED(429),
     /** 上游在限定时间内未返回：可重试类故障（仅幂等请求实际重试）。 */
     UPSTREAM_TIMEOUT(504),
     /** 批量调用中部分子请求失败：整体返回 207 风格的混合结果，逐条可区分。 */
     UPSTREAM_PARTIAL_FAILURE(207),
+    /** 批量调用中全部子请求失败：与部分失败严格区分，调用方应整批重试。 */
+    UPSTREAM_BATCH_FAILURE(502),
     /** 熔断器打开，请求被快速失败/降级，未触达上游：避免重复业务副作用。 */
     UPSTREAM_UNAVAILABLE(503),
     /** 上游返回确定性 5xx 或其他错误。 */

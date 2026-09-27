@@ -79,10 +79,12 @@ public class ResilientUpstreamClient implements UpstreamClient {
 
     @Override
     public UpstreamOutcome callBatch(List<UpstreamRequest> requests) {
-        // 批量调用不做整体重试，逐条执行：单条故障被隔离，最终归一化为部分成功/部分失败
+        // 批量调用不做整体重试，逐条执行：单条故障被隔离，最终归一化为
+        // 全部成功 / 部分失败 / 整批失败 / 整体降级（熔断打开，未触达上游）四类
         List<UpstreamResponse> responses = new ArrayList<>();
         int succeeded = 0;
         int failed = 0;
+        int degraded = 0;
         for (UpstreamRequest sub : requests) {
             UpstreamOutcome outcome = call(sub);
             if (outcome.success()) {
@@ -90,6 +92,9 @@ public class ResilientUpstreamClient implements UpstreamClient {
                 responses.add(outcome.response());
             } else {
                 failed++;
+                if (outcome.degraded()) {
+                    degraded++;
+                }
                 responses.add(new UpstreamResponse(500,
                         "{\"error\":\"" + (outcome.failureKind() == null
                                 ? "UPSTREAM_UNAVAILABLE" : outcome.failureKind()) + "\"}"));
@@ -97,6 +102,16 @@ public class ResilientUpstreamClient implements UpstreamClient {
         }
         if (failed == 0) {
             return UpstreamOutcome.batchOk(responses, succeeded);
+        }
+        if (degraded == failed && succeeded == 0) {
+            // 全部子请求均被熔断器快速失败：整批视为降级，未触达上游（attemptCount=0）
+            log.info("[上游结果] 批量调用整体降级（熔断打开，未触达上游）total={}", requests.size());
+            return UpstreamOutcome.failed(null, 0, true);
+        }
+        if (succeeded == 0) {
+            // 整批失败：与部分失败严格区分，调用方应整批重试而非逐条重试
+            log.info("[上游结果] 批量调用整批失败 total={} failed={}", requests.size(), failed);
+            return UpstreamOutcome.batchFailed(responses, failed);
         }
         log.info("[上游结果] 批量调用部分失败 succeeded={} failed={}", succeeded, failed);
         return UpstreamOutcome.partial(responses, succeeded, failed);

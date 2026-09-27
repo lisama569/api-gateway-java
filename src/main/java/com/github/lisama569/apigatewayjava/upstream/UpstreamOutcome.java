@@ -24,6 +24,12 @@ public record UpstreamOutcome(boolean success, UpstreamResponse response,
         return new UpstreamOutcome(true, null, List.copyOf(responses), null, count, false);
     }
 
+    /** 批量调用全部失败：逐条失败占位保留，但与部分失败严格区分（BATCH_FAILURE）。 */
+    public static UpstreamOutcome batchFailed(List<UpstreamResponse> responses, int count) {
+        return new UpstreamOutcome(false, null, List.copyOf(responses),
+                UpstreamFailureKind.BATCH_FAILURE, count, false);
+    }
+
     /** degraded=true 表示熔断器打开导致的快速失败，请求未触达上游（attemptCount=0）。 */
     public static UpstreamOutcome failed(UpstreamFailureKind kind, int attemptCount, boolean degraded) {
         return new UpstreamOutcome(false, null, null, kind, attemptCount, degraded);
