@@ -1,6 +1,7 @@
 package com.github.lisama569.apigatewayjava.tests;
 
 import com.github.lisama569.apigatewayjava.access.DefaultAccessService;
+import com.github.lisama569.apigatewayjava.api.BatchStatus;
 import com.github.lisama569.apigatewayjava.api.GatewayRequest;
 import com.github.lisama569.apigatewayjava.api.GatewayResult;
 import com.github.lisama569.apigatewayjava.api.GatewayService;
@@ -60,6 +61,8 @@ class BatchResultStatusTest {
         GatewayResult r = batch(3);
         assertTrue(r.isSuccess());
         assertEquals(200, r.getHttpStatus());
+        assertEquals(BatchStatus.ALL_SUCCEEDED, r.getBatchStatus(),
+                "全成功必须有明确标识，无需逐条比对");
         assertEquals(3, r.getBatchData().size());
         assertEquals(3, backend.callCount(KEY));
     }
@@ -72,6 +75,8 @@ class BatchResultStatusTest {
         assertFalse(r.isSuccess());
         assertEquals(ErrorCode.UPSTREAM_PARTIAL_FAILURE, r.getErrorCode());
         assertEquals(207, r.getHttpStatus());
+        assertEquals(BatchStatus.PARTIAL_FAILURE, r.getBatchStatus(),
+                "部分成功必须有明确标识");
         assertEquals(3, r.getBatchData().size(), "成功项与失败项必须逐条保留、可归因");
     }
 
@@ -85,6 +90,9 @@ class BatchResultStatusTest {
                 "整批失败必须可识别，不得伪装成部分成功");
         assertEquals(502, r.getHttpStatus());
         assertNotEquals(ErrorCode.UPSTREAM_PARTIAL_FAILURE, r.getErrorCode());
+        assertEquals(BatchStatus.ALL_FAILED, r.getBatchStatus(),
+                "整批失败必须有明确标识，不得被当成部分成功");
+        assertNotEquals(BatchStatus.PARTIAL_FAILURE, r.getBatchStatus());
         assertEquals(3, r.getBatchData().size(), "失败项仍逐条保留、可归因");
         assertFalse(r.isDegraded());
         // 不产生超出既有重试策略的重复上游调用：3 条 * 最多 2 次尝试 = 6
@@ -108,6 +116,13 @@ class BatchResultStatusTest {
         assertEquals(ErrorCode.UPSTREAM_UNAVAILABLE, r.getErrorCode());
         assertEquals(503, r.getHttpStatus());
         assertTrue(r.isDegraded());
+        assertEquals(BatchStatus.DEGRADED, r.getBatchStatus(),
+                "整批快速降级也必须有明确标识");
+        assertEquals(3, r.getBatchData().size(),
+                "整批降级后每条子请求的结果仍必须逐条保留、可逐条归因");
+        r.getBatchData().forEach(item -> assertTrue(
+                item.toString().contains("CIRCUIT_OPEN"),
+                "每条降级子结果都要能归因到熔断隔离： " + item));
         assertEquals(3, backend.callCount(KEY), "熔断期间整批快速降级，不得触达上游");
         log.info("[批量降级] 熔断打开，整批 503 且未触达上游 backendCalls={}", backend.callCount(KEY));
     }

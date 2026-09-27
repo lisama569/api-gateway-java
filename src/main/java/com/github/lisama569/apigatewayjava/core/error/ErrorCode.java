@@ -26,6 +26,10 @@ public enum ErrorCode {
     UPSTREAM_BATCH_FAILURE(502),
     /** 熔断器打开，请求被快速失败/降级，未触达上游：避免重复业务副作用。 */
     UPSTREAM_UNAVAILABLE(503),
+    /** 熔断器处于半开恢复期且探测名额已用完：请求被快速失败，未触达上游。
+     *  与 UPSTREAM_UNAVAILABLE（隔离期拒绝）严格区分——收到本错误码说明上游
+     *  正在恢复探测，调用方可适当缩短退避、准备重试。 */
+    UPSTREAM_RECOVERY_LIMITED(503),
     /** 上游返回确定性 5xx 或其他错误。 */
     UPSTREAM_ERROR(502);
 

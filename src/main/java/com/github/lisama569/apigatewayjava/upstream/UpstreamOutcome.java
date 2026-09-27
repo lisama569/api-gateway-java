@@ -34,4 +34,13 @@ public record UpstreamOutcome(boolean success, UpstreamResponse response,
     public static UpstreamOutcome failed(UpstreamFailureKind kind, int attemptCount, boolean degraded) {
         return new UpstreamOutcome(false, null, null, kind, attemptCount, degraded);
     }
+
+    /**
+     * 批量调用整体降级（熔断打开或恢复期探测名额耗尽）：未触达上游（attemptCount=0），
+     * 但每条子请求的归一化占位结果仍逐条保留，调用方可逐条对上、逐条归因。
+     */
+    public static UpstreamOutcome batchDegraded(List<UpstreamResponse> responses,
+                                                UpstreamFailureKind kind) {
+        return new UpstreamOutcome(false, null, List.copyOf(responses), kind, 0, true);
+    }
 }

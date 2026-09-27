@@ -154,13 +154,28 @@ public class GatewayService {
         if (outcome.success()) {
             return buildOk(versioned, outcome.responses(), outcome, true);
         }
-        // 熔断整体降级（503，未触达上游）
+        // 熔断整体降级（503，未触达上游）：逐条占位结果仍保留，可逐条归因；
+        // 隔离期拒绝（UPSTREAM_UNAVAILABLE）与恢复期名额耗尽（UPSTREAM_RECOVERY_LIMITED）
+        // 是两种不同的降级，错误码与日志均严格区分
         if (outcome.degraded()) {
+            boolean recoveryLimited = outcome.failureKind()
+                    == com.github.lisama569.apigatewayjava.upstream.UpstreamFailureKind.HALF_OPEN_PROBE_LIMIT;
+            ErrorCode code = recoveryLimited
+                    ? ErrorCode.UPSTREAM_RECOVERY_LIMITED : ErrorCode.UPSTREAM_UNAVAILABLE;
+            List<Object> degradedItems = outcome.responses() == null
+                    ? List.of() : new ArrayList<>(outcome.responses());
+            log.info("[降级分类] 批量 key={} code={} 逐条结果数={}（未触达上游）",
+                    key, code, degradedItems.size());
             return GatewayResult.builder()
                     .success(false)
-                    .errorCode(ErrorCode.UPSTREAM_UNAVAILABLE)
-                    .httpStatus(ErrorCode.UPSTREAM_UNAVAILABLE.httpStatus())
-                    .message("上游熔断器打开，整批请求被快速降级（未触达上游，无重复副作用）")
+                    .errorCode(code)
+                    .httpStatus(code.httpStatus())
+                    .message(recoveryLimited
+                            ? "上游处于恢复探测期且探测名额已用完，整批请求被快速降级"
+                              + "（未触达上游，无重复副作用）；与熔断隔离期拒绝不同，上游正在恢复，可稍后重试"
+                            : "上游熔断器打开（隔离期），整批请求被快速降级（未触达上游，无重复副作用）")
+                    .batchData(degradedItems)
+                    .batchStatus(BatchStatus.DEGRADED)
                     .degraded(true)
                     .build();
         }
@@ -175,6 +190,7 @@ public class GatewayService {
                     .message("批量调用全部子请求失败（共 " + items.size()
                             + " 条），无成功项，建议整批重试；失败项逐条保留在 data 中")
                     .batchData(items)
+                    .batchStatus(BatchStatus.ALL_FAILED)
                     .degraded(false)
                     .deprecated(versioned.status() == VersionStatus.DEPRECATED)
                     .deprecationNotice(versioned.deprecationNotice())
@@ -187,6 +203,7 @@ public class GatewayService {
                 .httpStatus(ErrorCode.UPSTREAM_PARTIAL_FAILURE.httpStatus())
                 .message("部分子请求失败，已对失败项做隔离，成功项结果保留在 data 中，仅需重试失败项")
                 .batchData(items)
+                .batchStatus(BatchStatus.PARTIAL_FAILURE)
                 .degraded(false)
                 .deprecated(versioned.status() == VersionStatus.DEPRECATED)
                 .deprecationNotice(versioned.deprecationNotice())
@@ -198,11 +215,21 @@ public class GatewayService {
             return buildOk(versioned, List.of(outcome.response()), outcome, false);
         }
         if (outcome.degraded()) {
+            // 两种快速降级严格区分：隔离期拒绝 vs 恢复期探测名额耗尽，
+            // 调用方可据此决定继续退避还是准备重试；两者均未触达上游
+            boolean recoveryLimited = outcome.failureKind()
+                    == com.github.lisama569.apigatewayjava.upstream.UpstreamFailureKind.HALF_OPEN_PROBE_LIMIT;
+            ErrorCode code = recoveryLimited
+                    ? ErrorCode.UPSTREAM_RECOVERY_LIMITED : ErrorCode.UPSTREAM_UNAVAILABLE;
+            log.info("[降级分类] code={}（未触达上游，无重复副作用）", code);
             return GatewayResult.builder()
                     .success(false)
-                    .errorCode(ErrorCode.UPSTREAM_UNAVAILABLE)
-                    .httpStatus(ErrorCode.UPSTREAM_UNAVAILABLE.httpStatus())
-                    .message("上游熔断器打开，请求被快速降级（未触达上游，无重复副作用）")
+                    .errorCode(code)
+                    .httpStatus(code.httpStatus())
+                    .message(recoveryLimited
+                            ? "上游处于恢复探测期且探测名额已用完，请求被快速降级"
+                              + "（未触达上游，无重复副作用）；上游正在恢复，可稍后重试"
+                            : "上游熔断器打开（隔离期），请求被快速降级（未触达上游，无重复副作用）")
                     .degraded(true)
                     .build();
         }
@@ -211,6 +238,9 @@ public class GatewayService {
             case PARTIAL_FAILURE -> ErrorCode.UPSTREAM_PARTIAL_FAILURE;
             case BATCH_FAILURE -> ErrorCode.UPSTREAM_BATCH_FAILURE;
             case ERROR_5XX -> ErrorCode.UPSTREAM_ERROR;
+            // 降级类 kind 已在上方 degraded 分支处理，此处仅为穷尽枚举
+            case CIRCUIT_OPEN -> ErrorCode.UPSTREAM_UNAVAILABLE;
+            case HALF_OPEN_PROBE_LIMIT -> ErrorCode.UPSTREAM_RECOVERY_LIMITED;
         };
         String message = switch (code) {
             case UPSTREAM_TIMEOUT -> "上游调用超时，已按重试策略处理后仍失败";
@@ -229,6 +259,7 @@ public class GatewayService {
                 .httpStatus(200)
                 .data(batch ? null : (items.isEmpty() ? null : items.get(0)))
                 .batchData(batch ? items : null)
+                .batchStatus(batch ? BatchStatus.ALL_SUCCEEDED : null)
                 .deprecated(deprecated)
                 .deprecationNotice(deprecated ? versioned.deprecationNotice() : null)
                 .degraded(false)

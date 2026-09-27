@@ -21,8 +21,10 @@
 - 请求头 `X-Batch: true`：走批量路径；请求体为子请求条数（默认 3）。
 - **配额成本**：单请求成本为 1；批量入口按子请求条数一次性扣减配额，
   额度不足以覆盖整批时整批拒绝（429 `QUOTA_EXCEEDED`），账目不做部分扣减。
-- **批量结果三态**：全部成功 200 / 部分成功 207 `UPSTREAM_PARTIAL_FAILURE` /
-  整批失败 502 `UPSTREAM_BATCH_FAILURE`，成功项与失败项逐条保留在 `batchData`。
+- **批量结果三态 + 降级**：全部成功 200 / 部分成功 207 `UPSTREAM_PARTIAL_FAILURE` /
+  整批失败 502 `UPSTREAM_BATCH_FAILURE`，另在熔断期整体降级 503；批量响应统一带
+  `batchStatus` 标识（`ALL_SUCCEEDED` / `PARTIAL_FAILURE` / `ALL_FAILED` / `DEGRADED`），
+  成功项与失败项逐条保留在 `batchData`（含整批降级，逐条占位可归因）。
 
 统一响应信封：
 
@@ -114,22 +116,29 @@
 | `UPSTREAM_ERROR` | **502** | 上游确定性 5xx / 执行异常 |
 | `UPSTREAM_BATCH_FAILURE` | **502** | 批量调用**全部**子请求失败（无成功项），建议整批重试 |
 | `UPSTREAM_PARTIAL_FAILURE` | **207** | 批量调用中**部分**子请求失败，成功项结果保留，失败项逐条隔离占位 |
-| `UPSTREAM_UNAVAILABLE` | **503** | 熔断器打开，请求被快速失败/降级，**未触达上游** |
+| `UPSTREAM_UNAVAILABLE` | **503** | 熔断器 **OPEN 隔离期**，请求被快速失败/降级，**未触达上游** |
+| `UPSTREAM_RECOVERY_LIMITED` | **503** | 熔断器 **HALF_OPEN 恢复期**探测名额已用完：请求被快速失败，**未触达上游**。与上一行严格区分——收到本错误码说明上游正在恢复探测，可缩短退避、准备重试 |
 
-### 4.2 批量调用的三种结果语义
+### 4.2 批量调用的结果语义
 
-| 结果 | `success` | HTTP / errorCode | 调用方动作 | 兼容性 |
-|---|---|---|---|---|
-| 全部成功 | `true` | **200**（无 errorCode） | 直接使用 `batchData` 全部条目 | 与历史行为一致 |
-| 部分成功 | `false` | **207** `UPSTREAM_PARTIAL_FAILURE` | **只需重试失败项** | 与历史行为一致；成功项/失败项均逐条保留在 `batchData` |
-| 整批失败 | `false` | **502** `UPSTREAM_BATCH_FAILURE`（新增） | **整批重试**，不得伪装成部分成功 | 历史版本把整批失败也报 207，升级后严格区分 |
+| 结果 | `batchStatus` | `success` | HTTP / errorCode | 调用方动作 | 兼容性 |
+|---|---|---|---|---|---|
+| 全部成功 | `ALL_SUCCEEDED` | `true` | **200**（无 errorCode） | 直接使用 `batchData` 全部条目 | 与历史行为一致 |
+| 部分成功 | `PARTIAL_FAILURE` | `false` | **207** `UPSTREAM_PARTIAL_FAILURE` | **只需重试失败项** | 与历史行为一致；成功项/失败项均逐条保留在 `batchData` |
+| 整批失败 | `ALL_FAILED` | `false` | **502** `UPSTREAM_BATCH_FAILURE` | **整批重试**，不得伪装成部分成功 | 历史版本把整批失败也报 207，升级后严格区分 |
+| 整体降级（熔断隔离期） | `DEGRADED` | `false` | **503** `UPSTREAM_UNAVAILABLE` | 继续退避后重试 | 历史版本整批降级不带逐条结果，升级后逐条保留 |
+| 整体降级（恢复期名额耗尽） | `DEGRADED` | `false` | **503** `UPSTREAM_RECOVERY_LIMITED` | 上游正在恢复，可缩短退避、尽快重试 | 新增 |
 
-- `batchData` 始终与请求的子请求**逐条对齐**：成功项为上游响应，
-  失败项为带 `{"error":"..."}` 的归一化占位，可按位置归因。
+- 无需逐条比对：批量响应统一带 `batchStatus` 字段，一眼分清
+  `ALL_SUCCEEDED` / `PARTIAL_FAILURE` / `ALL_FAILED` / `DEGRADED`。
+- `batchData` 始终与请求的子请求**逐条对齐、数量相等**：成功项为上游响应，
+  失败项/降级项为带 `{"error":"..."}` 的归一化占位（如 `CIRCUIT_OPEN`、
+  `HALF_OPEN_PROBE_LIMIT`、`TIMEOUT`、`ERROR_5XX`），可按位置归因。
+  **整批降级时每条子结果也保留**，不会因为降级而丢掉逐条明细。
 - 整批失败不会产生重试策略之外的重复上游调用（幂等子请求最多
   `max-attempts` 次尝试，非幂等只 1 次），无重复业务副作用。
-- 熔断打开期间的批量调用整体返回 **503** `UPSTREAM_UNAVAILABLE`
-  且 `degraded=true`，所有子请求均不触达上游，同样不计入任何额外尝试。
+- 熔断期间的批量调用整体返回 **503** 且 `degraded=true`，所有子请求均不触达上游，
+  同样不计入任何额外尝试；错误码按「隔离期 / 恢复期名额耗尽」区分（见 §4.5）。
 
 ### 4.3 安全重试（不产生重复业务副作用）
 
@@ -140,8 +149,10 @@
 ### 4.4 在途并发上限（过载保护）
 
 - 按 **调用方 + 资源**（key 形如 `caller-a:orders`）统计在途请求数，
-  超过 `gateway.concurrency.max-in-flight`（默认 100）的请求**立即快速失败**
+  超过 `gateway.concurrency.max-in-flight`（**默认 4**）的请求**立即快速失败**
   并返回 `CONCURRENCY_LIMIT_EXCEEDED`，不排队、不堆积线程；
+  默认值刻意取小，保证**不改任何配置、本地直接压测就能稳定复现过载**
+  （`DefaultConfigReproducibilityTest` 已固化），生产环境可按需调大（如 100）；
 - 请求结束（正常或异常）后在 `finally` 中立即释放名额，
   压力回落后无需任何干预自动恢复放行；
 - **与配额耗尽的区别**：配额是「时间窗内总量」，耗尽后需等窗口翻转，
@@ -163,9 +174,22 @@ HALF_OPEN --探测失败--> OPEN（重新计时，继续隔离）
 
 **恢复期并发规则**：进入 HALF_OPEN 后，最多同时放行
 `gateway.circuit.half-open-max-probes`（默认 1）个探测请求真正触达上游，
-其余并发请求立即返回 503 降级结果（不触达上游、无副作用），
+其余并发请求立即返回降级结果（不触达上游、无副作用），
 避免上游刚恢复就被并发流量再次打垮；探测成功后熔断器回到 CLOSED，
 自动恢复正常放行；探测失败则重新 OPEN 并重新计时，继续保持隔离。
+
+**两类快速失败严格可区分**（错误分类与日志一一对应，便于调用方决定退避还是重试）：
+
+| 熔断器状态 | 被拒请求拿到的结果 | 日志（ResilientUpstreamClient） |
+|---|---|---|
+| OPEN（隔离期，上游仍在故障） | 503 `UPSTREAM_UNAVAILABLE`（`degraded=true`，未触达上游） | `[上游结果] key=... 熔断打开（隔离期），快速失败（不触达上游）kind=CIRCUIT_OPEN` |
+| HALF_OPEN（恢复期探测名额已用完） | 503 `UPSTREAM_RECOVERY_LIMITED`（`degraded=true`，未触达上游） | `[上游结果] key=... 半开恢复期探测名额已满，快速失败（不触达上游）kind=HALF_OPEN_PROBE_LIMIT` |
+
+- 两者 HTTP 同为 503，但 **errorCode 不同、message 不同、日志不同**：
+  前者表示上游仍在故障，应继续退避；后者表示上游已在恢复探测，可缩短退避、准备重试。
+- 恢复期只有拿到名额的探测请求真正触达上游；名额耗尽的请求全部快速返回，
+  全过程触达次数精确可断言（3 次打开 + N 个探测），**不会多打上游、
+  不会产生重复业务副作用**。
 
 单条上游故障不会影响其他资源（故障隔离）；恢复后无需人工介入自动回到正常路径。
 
@@ -176,7 +200,7 @@ HALF_OPEN --探测失败--> OPEN（重新计时，继续隔离）
 | 键 | 默认 | 说明 |
 |---|---|---|
 | `gateway.quota.window-millis` | 60000 | 配额固定窗口长度 |
-| `gateway.concurrency.max-in-flight` | 100 | 按调用方+资源的在途并发上限，超出快速失败 |
+| `gateway.concurrency.max-in-flight` | **4** | 按调用方+资源的在途并发上限，超出快速失败；默认取小便于本地复现，生产可按需调大 |
 | `gateway.upstream.max-attempts` | 2 | 幂等请求最大尝试次数 |
 | `gateway.upstream.timeout-millis` | 300 | 单次上游调用超时 |
 | `gateway.circuit.failure-threshold` | 3 | 连续失败多少次后熔断 |
@@ -190,14 +214,25 @@ HALF_OPEN --探测失败--> OPEN（重新计时，继续隔离）
 需要 JDK 21+（已在 JDK 上验证编译目标 21），无需数据库、网络或凭据：
 
 ```bash
-mvn test            # 运行全部 35 个测试
+mvn test            # 运行全部 39 个测试
 mvn spring-boot:run # 可选：启动后用 curl 手工验证
 ```
 
-默认配置下批量配额效果不直观，手工验证时可在
-`src/main/resources/application.properties` 把
-`gateway.concurrency.max-in-flight` 调小（如 2）制造过载，
-或直接以单测作为本地复现入口（时钟、故障、延迟均可注入，秒级完成）。
+**默认配置（不改任何配置）即可稳定复现两类关键现象**，对应自动化用例
+`DefaultConfigReproducibilityTest`（断言全部基于状态/计数的条件轮询，
+不靠固定等待掐时间，不依赖外部服务）：
+
+- **过载快速拒绝**：默认在途上限 4，对慢资源（本地后端有内置延迟注入）
+  齐发 12 个并发请求，必然有请求立刻拿到 429 `CONCURRENCY_LIMIT_EXCEEDED`，
+  压力回落后自动恢复；
+- **恢复期有限探测**：默认连续失败 3 次打开熔断，冷却 5s 后进入 HALF_OPEN，
+  默认只放 1 个探测真正触达上游，其余请求立刻拿到 503
+  `UPSTREAM_RECOVERY_LIMITED`（与隔离期的 `UPSTREAM_UNAVAILABLE` 可区分），
+  探测成功后自动恢复。
+
+单测是更直接的本地复现入口（时钟、故障、延迟均可注入，秒级完成、
+无外部依赖）：`ConcurrencyLimitTest`、`HalfOpenRecoveryTest`、
+`DegradationClassificationTest`、`BatchResultStatusTest`。
 
 手工验证示例：
 
@@ -227,15 +262,20 @@ curl -s -H 'X-Caller-Id: caller-a' \
 | `VersionRoutingTest` | 多版本并存、未知 404、已移除 410、废弃仍服务且带提示 |
 | `AccessControlTest` | 401 / 403 / 429 三类拒绝可区分、配额原因可解释 |
 | `UpstreamResilienceTest` | 幂等重试、写请求不重试、超时 504、熔断打开 503 不触达上游、半开探测自动恢复、批量部分失败 207 |
-| `BatchResultStatusTest` | 批量全成功 200 / 部分成功 207 / 整批失败 502 三态可区分、失败逐条归因、熔断期批量 503 不触达上游 |
+| `BatchResultStatusTest` | 批量全成功 200 / 部分成功 207 / 整批失败 502 三态可区分（`batchStatus` 标识）、失败逐条归因、熔断期批量 503 不触达上游且逐条结果保留 |
 | `ConcurrencyLimitTest` | 过载 429 与配额耗尽可区分、不排队、名额立即释放、压力回落自动恢复 |
-| `HalfOpenRecoveryTest` | 恢复期并发只放行有限探测、其余快速降级；探测成功恢复 / 探测失败继续隔离；触达次数精确可断言 |
+| `HalfOpenRecoveryTest` | 恢复期并发只放行有限探测、其余快速降级；探测成功恢复 / 探测失败继续隔离；两类降级分类（`HALF_OPEN_PROBE_LIMIT` vs `CIRCUIT_OPEN`）可区分；触达次数精确可断言 |
+| `DegradationClassificationTest` | 网关层验证 503 `UPSTREAM_UNAVAILABLE`（隔离期）与 503 `UPSTREAM_RECOVERY_LIMITED`（恢复期名额耗尽）返回结果可区分，探测成功自动恢复 |
+| `DefaultConfigReproducibilityTest` | **零配置覆盖**的 Spring 上下文测试：默认阈值即可端到端复现过载快速拒绝与恢复期有限探测；阈值仍可配置；条件轮询断言、无固定 sleep |
 | `GatewayHttpIntegrationTest` | MockMvc 端到端校验 HTTP 状态码与响应信封一致 |
 
 测试日志按要求打印关键信息（中文前缀便于检索）：
 `[请求输入]`（调用方/资源/版本/方法）、`[限流判定]`（是否放行/错误码/
 本次消耗/已用/剩余/原因）、`[过载判定]`（在途数与上限）、
-`[上游调用结果]`（成功/故障类型/真实尝试次数/是否降级）。
+`[上游调用结果]`（成功/故障类型/真实尝试次数/是否降级）、
+`[上游结果]`（熔断器视角：`CIRCUIT_OPEN` 隔离期拒绝 / `HALF_OPEN_PROBE_LIMIT`
+恢复期名额耗尽拒绝 / 成功 attempt 次数）、
+`[降级分类]`（网关视角：最终错误码与逐条结果数）。
 
 ---
 

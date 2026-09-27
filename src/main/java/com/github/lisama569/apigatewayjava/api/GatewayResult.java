@@ -23,6 +23,9 @@ public class GatewayResult {
     private String deprecationNotice;
     private boolean degraded;
     private List<Object> batchData;
+    /** 批量调用的整体结果标识（仅批量响应携带）：ALL_SUCCEEDED / PARTIAL_FAILURE /
+     *  ALL_FAILED / DEGRADED，调用方无需逐条比对即可区分批量结果。 */
+    private BatchStatus batchStatus;
 
     public static GatewayResultBuilder builder() {
         return new GatewayResultBuilder();
@@ -37,6 +40,7 @@ public class GatewayResult {
     public String getDeprecationNotice() { return deprecationNotice; }
     public boolean isDegraded() { return degraded; }
     public List<Object> getBatchData() { return batchData; }
+    public BatchStatus getBatchStatus() { return batchStatus; }
 
     public static final class GatewayResultBuilder {
         private final GatewayResult r = new GatewayResult();
@@ -50,6 +54,7 @@ public class GatewayResult {
         public GatewayResultBuilder deprecationNotice(String notice) { r.deprecationNotice = notice; return this; }
         public GatewayResultBuilder degraded(boolean degraded) { r.degraded = degraded; return this; }
         public GatewayResultBuilder batchData(List<Object> batchData) { r.batchData = batchData; return this; }
+        public GatewayResultBuilder batchStatus(BatchStatus batchStatus) { r.batchStatus = batchStatus; return this; }
 
         public GatewayResult build() { return r; }
     }

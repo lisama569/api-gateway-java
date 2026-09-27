@@ -102,6 +102,11 @@ class HalfOpenRecoveryTest {
 
         assertEquals(MAX_PROBES, succeeded, "恢复期只放行有限个探测请求");
         assertEquals(8, degraded, "其余并发请求必须快速返回降级结果而非一拥而上");
+        // 关键：恢复期名额耗尽的快速失败必须携带可区分的分类，
+        // 与熔断隔离期拒绝（CIRCUIT_OPEN）不是同一种结果
+        assertTrue(outcomes.stream().filter(UpstreamOutcome::degraded)
+                        .allMatch(o -> o.failureKind() == UpstreamFailureKind.HALF_OPEN_PROBE_LIMIT),
+                "恢复期名额耗尽的快速失败必须标记为 HALF_OPEN_PROBE_LIMIT");
         // 3 次打开熔断 + 2 个探测 = 5，绝无额外触达（无重复副作用）
         assertEquals(5, backend.callCount(KEY));
 
@@ -128,11 +133,17 @@ class HalfOpenRecoveryTest {
 
         assertEquals(0, succeeded);
         assertEquals(8, degraded, "非探测请求快速降级，不触达上游");
+        assertTrue(outcomes.stream().filter(UpstreamOutcome::degraded)
+                        .allMatch(o -> o.failureKind() == UpstreamFailureKind.HALF_OPEN_PROBE_LIMIT),
+                "恢复期名额耗尽的快速失败必须标记为 HALF_OPEN_PROBE_LIMIT");
         assertEquals(5, backend.callCount(KEY), "只有 2 个探测触达上游且均失败");
         // 探测失败 -> 重新 OPEN，继续保持隔离
         assertEquals(CircuitState.OPEN, breaker.state(KEY));
         UpstreamOutcome rejected = callOnce();
         assertTrue(rejected.degraded(), "隔离期内请求继续快速降级");
+        // 关键：隔离期拒绝与恢复期名额耗尽是两种可区分的快速失败
+        assertEquals(UpstreamFailureKind.CIRCUIT_OPEN, rejected.failureKind(),
+                "隔离期拒绝必须标记为 CIRCUIT_OPEN，与 HALF_OPEN_PROBE_LIMIT 严格区分");
         assertEquals(5, backend.callCount(KEY), "隔离期内不得触达上游");
         log.info("[隔离保持] 探测失败后熔断器重新 OPEN，继续隔离");
     }

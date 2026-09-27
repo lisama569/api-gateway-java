@@ -58,6 +58,11 @@ public class SlidingWindowCircuitBreaker implements CircuitBreaker {
 
     @Override
     public boolean allowRequest(String key) {
+        return tryEnter(key) == CircuitDecision.ALLOWED;
+    }
+
+    @Override
+    public CircuitDecision tryEnter(String key) {
         Breaker b = breaker(key);
         synchronized (b) {
             long now = clock.getAsLong();
@@ -67,14 +72,16 @@ public class SlidingWindowCircuitBreaker implements CircuitBreaker {
                 b.inFlightProbes = 0;
             }
             if (b.state == CircuitState.HALF_OPEN) {
-                // 只放行有限个探测；其余并发请求快速失败（降级），不触达上游
+                // 只放行有限个探测；其余并发请求快速失败（降级），不触达上游。
+                // 这种拒绝与 OPEN 拒绝严格区分：调用方可据此判断上游已在恢复期
                 if (b.inFlightProbes >= halfOpenMaxProbes) {
-                    return false;
+                    return CircuitDecision.REJECTED_HALF_OPEN;
                 }
                 b.inFlightProbes++;
-                return true;
+                return CircuitDecision.ALLOWED;
             }
-            return b.state != CircuitState.OPEN;
+            return b.state == CircuitState.OPEN
+                    ? CircuitDecision.REJECTED_OPEN : CircuitDecision.ALLOWED;
         }
     }
 

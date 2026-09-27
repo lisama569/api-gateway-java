@@ -52,9 +52,17 @@ public class ResilientUpstreamClient implements UpstreamClient {
     public UpstreamOutcome call(UpstreamRequest request) {
         String key = request.key();
 
-        if (!circuitBreaker.allowRequest(key)) {
-            log.info("[上游结果] key={} 熔断打开，快速失败（不触达上游）", key);
-            return UpstreamOutcome.failed(null, 0, true);
+        CircuitDecision decision = circuitBreaker.tryEnter(key);
+        if (decision != CircuitDecision.ALLOWED) {
+            // 两种快速失败必须可区分：OPEN 隔离期拒绝 vs HALF_OPEN 恢复期名额耗尽
+            if (decision == CircuitDecision.REJECTED_HALF_OPEN) {
+                log.info("[上游结果] key={} 半开恢复期探测名额已满，快速失败（不触达上游）kind={}",
+                        key, UpstreamFailureKind.HALF_OPEN_PROBE_LIMIT);
+                return UpstreamOutcome.failed(UpstreamFailureKind.HALF_OPEN_PROBE_LIMIT, 0, true);
+            }
+            log.info("[上游结果] key={} 熔断打开（隔离期），快速失败（不触达上游）kind={}",
+                    key, UpstreamFailureKind.CIRCUIT_OPEN);
+            return UpstreamOutcome.failed(UpstreamFailureKind.CIRCUIT_OPEN, 0, true);
         }
 
         int attempts = Math.min(maxAttempts, request.idempotent() ? maxAttempts : 1);
@@ -85,6 +93,7 @@ public class ResilientUpstreamClient implements UpstreamClient {
         int succeeded = 0;
         int failed = 0;
         int degraded = 0;
+        boolean anyProbeLimited = false;
         for (UpstreamRequest sub : requests) {
             UpstreamOutcome outcome = call(sub);
             if (outcome.success()) {
@@ -94,6 +103,9 @@ public class ResilientUpstreamClient implements UpstreamClient {
                 failed++;
                 if (outcome.degraded()) {
                     degraded++;
+                    if (outcome.failureKind() == UpstreamFailureKind.HALF_OPEN_PROBE_LIMIT) {
+                        anyProbeLimited = true;
+                    }
                 }
                 responses.add(new UpstreamResponse(500,
                         "{\"error\":\"" + (outcome.failureKind() == null
@@ -104,9 +116,14 @@ public class ResilientUpstreamClient implements UpstreamClient {
             return UpstreamOutcome.batchOk(responses, succeeded);
         }
         if (degraded == failed && succeeded == 0) {
-            // 全部子请求均被熔断器快速失败：整批视为降级，未触达上游（attemptCount=0）
-            log.info("[上游结果] 批量调用整体降级（熔断打开，未触达上游）total={}", requests.size());
-            return UpstreamOutcome.failed(null, 0, true);
+            // 全部子请求均被熔断器快速失败：整批视为降级，未触达上游（attemptCount=0）。
+            // 逐条占位结果保留在 responses 中，调用方可逐条对上、逐条归因；
+            // 降级原因（OPEN 隔离 / HALF_OPEN 名额耗尽）在 kind 上严格区分。
+            UpstreamFailureKind kind = anyProbeLimited
+                    ? UpstreamFailureKind.HALF_OPEN_PROBE_LIMIT
+                    : UpstreamFailureKind.CIRCUIT_OPEN;
+            log.info("[上游结果] 批量调用整体降级 kind={}（未触达上游）total={}", kind, requests.size());
+            return UpstreamOutcome.batchDegraded(responses, kind);
         }
         if (succeeded == 0) {
             // 整批失败：与部分失败严格区分，调用方应整批重试而非逐条重试
