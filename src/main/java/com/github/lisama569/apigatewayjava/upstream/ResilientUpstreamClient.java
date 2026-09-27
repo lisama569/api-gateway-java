@@ -15,11 +15,15 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 
 /**
- * 弹性上游客户端：在真实后端之上叠加「超时控制 + 重试 + 熔断 + 部分失败归一化」。
+ * 弹性上游客户端：在真实后端之上叠加「超时控制 + 重试 + 熔断 + 恢复期探测限流 + 批量归一化」。
  *
  * 重试安全规则：仅对幂等请求（GET 等）重试；非幂等请求（POST 等）只尝试一次，
- * 因此上游在写操作过程中超时也不会造成重复业务副作用。熔断打开时请求被快速失败，
- * attemptCount=0，同样不会触达上游。
+ * 因此上游在写操作过程中超时也不会造成重复业务副作用。
+ *
+ * 熔断/恢复期规则：熔断打开期间请求被快速失败（{@link UpstreamFailureKind#BREAKER_OPEN}，
+ * attemptCount=0，不触达上游）；HALF_OPEN 恢复期内只有熔断器放出的有限探测名额会触达上游，
+ * 其余请求快速降级为 {@link UpstreamFailureKind#RECOVERY_LIMITED}（同样 attemptCount=0）。
+ * 探测成功自动恢复正常放行，探测失败重新打开保持隔离，整个过程不产生重复副作用。
  */
 @Component
 public class ResilientUpstreamClient implements UpstreamClient {
@@ -52,9 +56,14 @@ public class ResilientUpstreamClient implements UpstreamClient {
     public UpstreamOutcome call(UpstreamRequest request) {
         String key = request.key();
 
-        if (!circuitBreaker.allowRequest(key)) {
+        CircuitBreaker.Admission admission = circuitBreaker.allowRequest(key);
+        if (admission == CircuitBreaker.Admission.REJECTED_OPEN) {
             log.info("[上游结果] key={} 熔断打开，快速失败（不触达上游）", key);
-            return UpstreamOutcome.failed(null, 0, true);
+            return UpstreamOutcome.failed(UpstreamFailureKind.BREAKER_OPEN, 0, true);
+        }
+        if (admission == CircuitBreaker.Admission.REJECTED_RECOVERY_LIMITED) {
+            log.info("[上游结果] key={} 恢复期探测名额已满，快速降级（不触达上游）", key);
+            return UpstreamOutcome.failed(UpstreamFailureKind.RECOVERY_LIMITED, 0, true);
         }
 
         int attempts = Math.min(maxAttempts, request.idempotent() ? maxAttempts : 1);
@@ -79,27 +88,29 @@ public class ResilientUpstreamClient implements UpstreamClient {
 
     @Override
     public UpstreamOutcome callBatch(List<UpstreamRequest> requests) {
-        // 批量调用不做整体重试，逐条执行：单条故障被隔离，最终归一化为部分成功/部分失败
-        List<UpstreamResponse> responses = new ArrayList<>();
+        // 批量调用不做整体重试（避免整批重复业务副作用）：逐条执行，单条故障被隔离，
+        // 最终由 UpstreamOutcome.batch 归一化为 全成功 / 部分成功 / 全失败 三种可区分状态。
+        List<UpstreamOutcome.Item> items = new ArrayList<>();
         int succeeded = 0;
         int failed = 0;
         for (UpstreamRequest sub : requests) {
             UpstreamOutcome outcome = call(sub);
             if (outcome.success()) {
                 succeeded++;
-                responses.add(outcome.response());
+                items.add(UpstreamOutcome.Item.ok(outcome.response(), outcome.attemptCount()));
             } else {
                 failed++;
-                responses.add(new UpstreamResponse(500,
-                        "{\"error\":\"" + (outcome.failureKind() == null
-                                ? "UPSTREAM_UNAVAILABLE" : outcome.failureKind()) + "\"}"));
+                items.add(UpstreamOutcome.Item.failed(
+                        outcome.failureKind(), outcome.attemptCount(), outcome.degraded()));
             }
         }
-        if (failed == 0) {
-            return UpstreamOutcome.batchOk(responses, succeeded);
+        UpstreamOutcome batch = UpstreamOutcome.batch(items);
+        if (failed > 0) {
+            log.info("[上游结果] 批量调用 succeeded={} failed={} total={} degradedItems={}",
+                    succeeded, failed, requests.size(),
+                    items.stream().filter(UpstreamOutcome.Item::degraded).count());
         }
-        log.info("[上游结果] 批量调用部分失败 succeeded={} failed={}", succeeded, failed);
-        return UpstreamOutcome.partial(responses, succeeded, failed);
+        return batch;
     }
 
     private UpstreamResponse invokeWithTimeout(UpstreamRequest request) {

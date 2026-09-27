@@ -6,6 +6,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
@@ -22,10 +23,23 @@ public class InMemoryBackend {
     private final Map<String, Fault> faults = new ConcurrentHashMap<>();
     private final Map<String, Long> latencies = new ConcurrentHashMap<>();
     private final Map<String, AtomicInteger> counters = new ConcurrentHashMap<>();
+    private final Map<String, Block> blocks = new ConcurrentHashMap<>();
 
     public UpstreamResponse invoke(UpstreamRequest request) {
         String key = request.key();
         counters.computeIfAbsent(key, k -> new AtomicInteger()).incrementAndGet();
+
+        Block block = blocks.get(key);
+        if (block != null) {
+            // 测试钩子：进入真实后端后发信号，并等待放行，用于稳定制造「一个探测在途」的窗口
+            block.entered.countDown();
+            try {
+                block.release.await();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new UpstreamException(UpstreamFailureKind.TIMEOUT, "上游调用被中断");
+            }
+        }
 
         long latency = latencies.getOrDefault(key, 0L);
         if (latency > 0) {
@@ -90,6 +104,35 @@ public class InMemoryBackend {
     public void resetAll() {
         clearFaults();
         counters.clear();
+        blocks.clear();
+    }
+
+    /**
+     * 测试钩子：让对该 key 的调用在真正进入后端后阻塞，直到调用 {@link #releaseBlock(String)}。
+     * 可通过 {@link #awaitEntered} 等待至少 {@code enteredCount} 个调用已进入后端，
+     * 用于确定性地制造「探测请求在途、其余并发请求应被快速降级」的并发场景。
+     */
+    public void block(String key, int enteredCount) {
+        blocks.put(key, new Block(new CountDownLatch(enteredCount), new CountDownLatch(1)));
+    }
+
+    /** 等待指定数量的调用已进入并阻塞在后端。 */
+    public void awaitEntered(String key) throws InterruptedException {
+        Block b = blocks.get(key);
+        if (b != null) {
+            b.entered.await();
+        }
+    }
+
+    /** 放行所有阻塞在该 key 上的调用。 */
+    public void releaseBlock(String key) {
+        Block b = blocks.get(key);
+        if (b != null) {
+            b.release.countDown();
+        }
+    }
+
+    private record Block(CountDownLatch entered, CountDownLatch release) {
     }
 
     private record Fault(UpstreamFailureKind kind, AtomicInteger remaining) {

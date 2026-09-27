@@ -8,6 +8,8 @@ import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMock
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.test.web.servlet.MockMvc;
 
+import com.github.lisama569.apigatewayjava.identity.InMemoryCallerDirectory;
+
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
@@ -24,6 +26,18 @@ class GatewayHttpIntegrationTest {
 
     @Autowired
     private MockMvc mockMvc;
+
+    @Autowired
+    private InMemoryCallerDirectory callerDirectory;
+
+    @org.junit.jupiter.api.BeforeEach
+    void registerDedicatedBatchCaller() {
+        // 两个专用调用方：各有独立配额窗口，避免与既有 caller-c 用例及彼此之间相互影响
+        callerDirectory.register("caller-batch-ok",
+                java.util.Set.of("payments", "orders"), 3);
+        callerDirectory.register("caller-batch-quota",
+                java.util.Set.of("payments", "orders"), 3);
+    }
 
     @Test
     void happyPathReturns200() throws Exception {
@@ -93,5 +107,38 @@ class GatewayHttpIntegrationTest {
                         .content("\"order-payload\""))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.success").value(true));
+    }
+
+    @Test
+    void batchAllSuccessReportsAllSuccessEnvelope() throws Exception {
+        // caller-batch-ok 配额 3：3 个子请求按 3 计费（orders）
+        mockMvc.perform(post("/api/gateway/orders/v2/batch")
+                        .header("X-Caller-Id", "caller-batch-ok")
+                        .content("3"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true))
+                .andExpect(jsonPath("$.batchStatus").value("ALL_SUCCESS"))
+                .andExpect(jsonPath("$.batchTotal").value(3))
+                .andExpect(jsonPath("$.batchSucceeded").value(3))
+                .andExpect(jsonPath("$.batchFailed").value(0))
+                .andExpect(jsonPath("$.batchItems.length()").value(3));
+        log.info("[HTTP 批量] ALL_SUCCESS 信封：batchStatus/计数/逐条 items 齐备");
+    }
+
+    @Test
+    void batchQuotaIsChargedBySubRequestCount() throws Exception {
+        // caller-batch-quota 配额 3：一批 3 个子请求恰好打满；第二批即使只有 2 个也整笔 429
+        mockMvc.perform(post("/api/gateway/payments/v1/batch")
+                        .header("X-Caller-Id", "caller-batch-quota")
+                        .content("3"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.batchStatus").value("ALL_SUCCESS"));
+        mockMvc.perform(post("/api/gateway/payments/v1/batch")
+                        .header("X-Caller-Id", "caller-batch-quota")
+                        .content("2"))
+                .andExpect(status().isTooManyRequests())
+                .andExpect(jsonPath("$.errorCode").value("QUOTA_EXCEEDED"))
+                .andExpect(jsonPath("$.message").value(org.hamcrest.Matchers.containsString("整批拒绝")));
+        log.info("[HTTP 批量计费] 3 个子请求消耗 3 额度，后续整批 429 且账目一致");
     }
 }

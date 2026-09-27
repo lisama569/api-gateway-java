@@ -20,7 +20,7 @@ public class DefaultAccessService implements AccessService {
     }
 
     @Override
-    public AccessResult check(String callerId, String resource) {
+    public AccessResult authenticate(String callerId, String resource) {
         // 1) 身份认证：缺失/空白/未登记 -> IDENTITY_INVALID(401)
         CallerProfile profile;
         if (callerId == null || callerId.isBlank()) {
@@ -41,12 +41,21 @@ public class DefaultAccessService implements AccessService {
                     "调用方 '" + callerId + "' 无权访问资源 '" + resource
                             + "'，允许的资源：" + profile.allowedResources());
         }
+        return AccessResult.ok(profile);
+    }
 
-        // 3) 配额判定：授权通过但窗口配额耗尽 -> QUOTA_EXCEEDED(429)
-        QuotaDecision decision = quotaService.tryAcquire(callerId, profile.quotaLimit());
+    @Override
+    public AccessResult charge(CallerProfile caller, String resource, long cost) {
+        // 3) 配额判定：授权通过但窗口剩余额度不足以覆盖本次成本 -> QUOTA_EXCEEDED(429)
+        QuotaDecision decision = chargeDecision(caller, resource, cost);
         if (!decision.allowed()) {
             return AccessResult.reject(ErrorCode.QUOTA_EXCEEDED, decision.reason());
         }
-        return AccessResult.ok(profile);
+        return AccessResult.ok(caller);
+    }
+
+    @Override
+    public QuotaDecision chargeDecision(CallerProfile caller, String resource, long cost) {
+        return quotaService.tryAcquire(caller.callerId(), caller.quotaLimit(), cost);
     }
 }
