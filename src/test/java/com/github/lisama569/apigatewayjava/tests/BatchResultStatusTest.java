@@ -108,7 +108,20 @@ class BatchResultStatusTest {
         assertEquals(ErrorCode.UPSTREAM_UNAVAILABLE, r.getErrorCode());
         assertEquals(503, r.getHttpStatus());
         assertTrue(r.isDegraded());
+        assertEquals(3, r.getBatchData().size(), "整批降级也必须逐条保留结果，不得丢明细");
+        for (int i = 0; i < 3; i++) {
+            com.github.lisama569.apigatewayjava.api.BatchItemView item =
+                    (com.github.lisama569.apigatewayjava.api.BatchItemView)
+                            r.getBatchData().get(i);
+            assertEquals(i, item.index(), "降级条目仍按位置对齐");
+            assertFalse(item.success());
+            assertEquals("UPSTREAM_UNAVAILABLE", item.errorCode(), "每条独立归因");
+            assertEquals(503, item.httpStatus());
+            assertTrue(item.degraded());
+            assertEquals(0, item.attempts(), "降级条目未触达上游");
+        }
         assertEquals(3, backend.callCount(KEY), "熔断期间整批快速降级，不得触达上游");
-        log.info("[批量降级] 熔断打开，整批 503 且未触达上游 backendCalls={}", backend.callCount(KEY));
+        log.info("[批量降级] 熔断打开，整批 503 且未触达上游 backendCalls={}，3 条逐条归因",
+                backend.callCount(KEY));
     }
 }

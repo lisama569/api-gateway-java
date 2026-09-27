@@ -33,11 +33,14 @@ public class GatewayController {
             @PathVariable String version,
             @RequestHeader(value = "X-Caller-Id", required = false) String callerId,
             @RequestHeader(value = "X-Batch", required = false, defaultValue = "false") boolean batch,
+            @RequestHeader(value = "X-Demo-Fault", required = false) String demoFault,
+            @RequestHeader(value = "X-Demo-Latency-Millis", required = false,
+                    defaultValue = "0") long demoLatencyMillis,
             @RequestBody(required = false) String payload,
             HttpServletRequest httpRequest) {
 
         GatewayRequest request = new GatewayRequest(resource, version,
-                httpRequest.getMethod(), payload);
+                httpRequest.getMethod(), payload, demoFault, demoLatencyMillis);
         GatewayResult result = gatewayService.route(request, callerId, batch);
         return ResponseEntity.status(result.getHttpStatus()).body(result);
     }
@@ -48,8 +51,12 @@ public class GatewayController {
             @PathVariable String resource,
             @PathVariable String version,
             @RequestHeader(value = "X-Caller-Id", required = false) String callerId,
+            @RequestHeader(value = "X-Demo-Fault", required = false) String demoFault,
+            @RequestHeader(value = "X-Demo-Latency-Millis", required = false,
+                    defaultValue = "0") long demoLatencyMillis,
             @RequestBody(required = false) String payload) {
-        GatewayRequest request = new GatewayRequest(resource, version, "GET", payload);
+        GatewayRequest request = new GatewayRequest(resource, version, "GET", payload,
+                demoFault, demoLatencyMillis);
         GatewayResult result = gatewayService.route(request, callerId, true);
         return ResponseEntity.status(result.getHttpStatus()).body(result);
     }

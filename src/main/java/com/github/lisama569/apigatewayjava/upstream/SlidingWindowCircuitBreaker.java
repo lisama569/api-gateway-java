@@ -1,5 +1,6 @@
 package com.github.lisama569.apigatewayjava.upstream;
 
+import com.github.lisama569.apigatewayjava.core.time.GatewayClock;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
@@ -34,8 +35,10 @@ public class SlidingWindowCircuitBreaker implements CircuitBreaker {
     public SlidingWindowCircuitBreaker(
             @Value("${gateway.circuit.failure-threshold:3}") int failureThreshold,
             @Value("${gateway.circuit.open-duration-millis:5000}") long openDurationMillis,
-            @Value("${gateway.circuit.half-open-max-probes:1}") int halfOpenMaxProbes) {
-        this(failureThreshold, openDurationMillis, halfOpenMaxProbes, System::currentTimeMillis);
+            @Value("${gateway.circuit.half-open-max-probes:1}") int halfOpenMaxProbes,
+            GatewayClock clock) {
+        this(failureThreshold, openDurationMillis, halfOpenMaxProbes,
+                (LongSupplier) clock);
     }
 
     /** 兼容构造器：默认半开只放行 1 个探测。 */
@@ -58,6 +61,11 @@ public class SlidingWindowCircuitBreaker implements CircuitBreaker {
 
     @Override
     public boolean allowRequest(String key) {
+        return admit(key) == Admission.ALLOWED;
+    }
+
+    @Override
+    public Admission admit(String key) {
         Breaker b = breaker(key);
         synchronized (b) {
             long now = clock.getAsLong();
@@ -67,14 +75,18 @@ public class SlidingWindowCircuitBreaker implements CircuitBreaker {
                 b.inFlightProbes = 0;
             }
             if (b.state == CircuitState.HALF_OPEN) {
-                // 只放行有限个探测；其余并发请求快速失败（降级），不触达上游
+                // 只放行有限个探测；其余并发请求快速失败（降级），不触达上游。
+                // 注意：此时的拒绝是「恢复期名额用尽」，与 OPEN 挡回严格区分，
+                // 调用方可以据此选择尽快重试而非继续长时间退避。
                 if (b.inFlightProbes >= halfOpenMaxProbes) {
-                    return false;
+                    return Admission.REJECTED_RECOVERY_LIMITED;
                 }
                 b.inFlightProbes++;
-                return true;
+                return Admission.ALLOWED;
             }
-            return b.state != CircuitState.OPEN;
+            return b.state == CircuitState.OPEN
+                    ? Admission.REJECTED_OPEN
+                    : Admission.ALLOWED;
         }
     }
 

@@ -24,8 +24,14 @@ public enum ErrorCode {
     UPSTREAM_PARTIAL_FAILURE(207),
     /** 批量调用中全部子请求失败：与部分失败严格区分，调用方应整批重试。 */
     UPSTREAM_BATCH_FAILURE(502),
-    /** 熔断器打开，请求被快速失败/降级，未触达上游：避免重复业务副作用。 */
+    /** 熔断器打开（上游仍在隔离期），请求被快速失败/降级，未触达上游：应继续退避。 */
     UPSTREAM_UNAVAILABLE(503),
+    /**
+     * 熔断器处于恢复期（HALF_OPEN），本轮有限探测名额已用尽：
+     * 与 UPSTREAM_UNAVAILABLE 同为 503、均未触达上游，但含义不同——
+     * 上游可能即将恢复，调用方可在极短退避后尽快重试，而非等待下一个冷却周期。
+     */
+    UPSTREAM_RECOVERY_LIMITED(503),
     /** 上游返回确定性 5xx 或其他错误。 */
     UPSTREAM_ERROR(502);
 

@@ -22,6 +22,12 @@ public class GatewayResult {
     private boolean deprecated;
     private String deprecationNotice;
     private boolean degraded;
+    /**
+     * 降级原因（机器可读），仅 degraded=true 时存在：
+     * {@code CIRCUIT_OPEN}（熔断 OPEN 挡回，应继续退避）或
+     * {@code RECOVERY_PROBE_CAPACITY_FULL}（恢复期探测名额用尽，可尽快重试）。
+     */
+    private String degradeReason;
     private List<Object> batchData;
 
     public static GatewayResultBuilder builder() {
@@ -36,6 +42,7 @@ public class GatewayResult {
     public boolean isDeprecated() { return deprecated; }
     public String getDeprecationNotice() { return deprecationNotice; }
     public boolean isDegraded() { return degraded; }
+    public String getDegradeReason() { return degradeReason; }
     public List<Object> getBatchData() { return batchData; }
 
     public static final class GatewayResultBuilder {
@@ -49,6 +56,7 @@ public class GatewayResult {
         public GatewayResultBuilder deprecated(boolean deprecated) { r.deprecated = deprecated; return this; }
         public GatewayResultBuilder deprecationNotice(String notice) { r.deprecationNotice = notice; return this; }
         public GatewayResultBuilder degraded(boolean degraded) { r.degraded = degraded; return this; }
+        public GatewayResultBuilder degradeReason(String degradeReason) { r.degradeReason = degradeReason; return this; }
         public GatewayResultBuilder batchData(List<Object> batchData) { r.batchData = batchData; return this; }
 
         public GatewayResult build() { return r; }

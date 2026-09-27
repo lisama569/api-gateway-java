@@ -1,5 +1,6 @@
 package com.github.lisama569.apigatewayjava.quota;
 
+import com.github.lisama569.apigatewayjava.core.time.GatewayClock;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
@@ -27,8 +28,9 @@ public class FixedWindowQuotaService implements QuotaService {
 
     @Autowired
     public FixedWindowQuotaService(
-            @Value("${gateway.quota.window-millis:60000}") long windowMillis) {
-        this(windowMillis, System::currentTimeMillis);
+            @Value("${gateway.quota.window-millis:60000}") long windowMillis,
+            GatewayClock clock) {
+        this(windowMillis, (java.util.function.LongSupplier) clock);
     }
 
     /** 测试用构造器：可注入时钟。 */

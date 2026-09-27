@@ -94,4 +94,49 @@ class GatewayHttpIntegrationTest {
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.success").value(true));
     }
+
+    @Test
+    void batchAllSuccessExposesIndexedItems() throws Exception {
+        mockMvc.perform(post("/api/gateway/orders/v2/batch")
+                        .header("X-Caller-Id", "caller-a")
+                        .content("3"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true))
+                .andExpect(jsonPath("$.batchData.length()").value(3))
+                .andExpect(jsonPath("$.batchData[0].index").value(0))
+                .andExpect(jsonPath("$.batchData[0].success").value(true))
+                .andExpect(jsonPath("$.batchData[1].data.resource").value("orders"));
+    }
+
+    @Test
+    void batchPartialFailureExposesPerItemAttribution() throws Exception {
+        // 前 1 条子请求故障（GET 幂等，2 次尝试均失败），其余成功 -> 207
+        mockMvc.perform(post("/api/gateway/orders/v2/batch")
+                        .header("X-Caller-Id", "caller-a")
+                        .header("X-Demo-Fault", "ERROR_5XX:1")
+                        .content("3"))
+                .andExpect(status().isMultiStatus())
+                .andExpect(jsonPath("$.errorCode").value("UPSTREAM_PARTIAL_FAILURE"))
+                .andExpect(jsonPath("$.batchData.length()").value(3))
+                .andExpect(jsonPath("$.batchData[0].success").value(false))
+                .andExpect(jsonPath("$.batchData[0].errorCode").value("ERROR_5XX"))
+                .andExpect(jsonPath("$.batchData[0].httpStatus").value(502))
+                .andExpect(jsonPath("$.batchData[0].attempts").value(2))
+                .andExpect(jsonPath("$.batchData[0].message").isNotEmpty())
+                .andExpect(jsonPath("$.batchData[1].success").value(true))
+                .andExpect(jsonPath("$.batchData[2].success").value(true));
+    }
+
+    @Test
+    void batchAllFailedIs502WithEveryItemAttributed() throws Exception {
+        mockMvc.perform(post("/api/gateway/orders/v2/batch")
+                        .header("X-Caller-Id", "caller-a")
+                        .header("X-Demo-Fault", "ERROR_5XX")
+                        .content("2"))
+                .andExpect(status().isBadGateway())
+                .andExpect(jsonPath("$.errorCode").value("UPSTREAM_BATCH_FAILURE"))
+                .andExpect(jsonPath("$.batchData.length()").value(2))
+                .andExpect(jsonPath("$.batchData[0].errorCode").value("ERROR_5XX"))
+                .andExpect(jsonPath("$.batchData[1].errorCode").value("ERROR_5XX"));
+    }
 }

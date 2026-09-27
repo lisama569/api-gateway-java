@@ -24,7 +24,7 @@ public class InFlightLimiter {
     private final ConcurrentHashMap<String, AtomicInteger> inFlight = new ConcurrentHashMap<>();
 
     @Autowired
-    public InFlightLimiter(@Value("${gateway.concurrency.max-in-flight:100}") int maxInFlight) {
+    public InFlightLimiter(@Value("${gateway.concurrency.max-in-flight:8}") int maxInFlight) {
         this.maxInFlight = maxInFlight;
     }
 

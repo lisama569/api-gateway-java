@@ -27,6 +27,9 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * 故障恢复期并发规则：上游刚从连续故障中恢复时，只有有限个探测请求
  * 真正触达上游，其余并发请求快速返回降级结果；探测成功自动恢复放行，
  * 探测失败继续保持隔离。全程不产生重复副作用。
+ *
+ * 同步方式：阻塞闸门让恰好 MAX_PROBES 个探测真实在途，再等其余请求全部
+ * 拿到降级结果后才放行探测——不依赖固定延迟/抢占，断言稳定不偶发。
  */
 class HalfOpenRecoveryTest {
 
@@ -62,7 +65,8 @@ class HalfOpenRecoveryTest {
         assertEquals(3, backend.callCount(KEY));
     }
 
-    private List<UpstreamOutcome> fireConcurrent(int threads) throws InterruptedException {
+    private List<UpstreamOutcome> fireConcurrent(int threads, int expectedDegraded)
+            throws InterruptedException {
         CountDownLatch start = new CountDownLatch(1);
         CountDownLatch done = new CountDownLatch(threads);
         ExecutorService pool = Executors.newFixedThreadPool(threads);
@@ -80,21 +84,36 @@ class HalfOpenRecoveryTest {
             });
         }
         start.countDown();
+        // 恰好 MAX_PROBES 个探测真实进入上游（持续在途，被闸门挡住）
+        backend.awaitEntered(MAX_PROBES, 10_000L);
+        // 等其余请求在探针结算前全部拿到降级快速返回
+        long deadline = System.currentTimeMillis() + 10_000L;
+        long degradedSoFar;
+        while (true) {
+            degradedSoFar = outcomes.stream().filter(UpstreamOutcome::degraded).count();
+            if (degradedSoFar >= expectedDegraded) {
+                break;
+            }
+            assertTrue(System.currentTimeMillis() < deadline, "非探测请求未在预期内快速降级");
+            Thread.sleep(1L);
+        }
+        assertEquals(MAX_PROBES, backend.enteredCount(), "探针放行前在途数必须恒为 MAX_PROBES");
+        backend.releaseGate();
         assertTrue(done.await(15, TimeUnit.SECONDS), "并发请求不得无限排队");
         pool.shutdown();
-        return outcomes;
+        return new ArrayList<>(outcomes);
     }
 
     @Test
     void onlyLimitedProbesReachUpstreamDuringRecovery() throws InterruptedException {
         openCircuit();
 
-        // 上游已恢复（清除故障），但请求需要一段时间在途，制造并发窗口
+        // 上游已恢复（清除故障）；进入 HALF_OPEN，探针被闸门挡住制造并发窗口
         backend.clearFaults();
-        backend.setLatencyMillis(KEY, 300L);
-        clock[0] = 5001L; // 超过 open-duration，进入 HALF_OPEN
+        backend.blockOnGate();
+        clock[0] = 5001L;
 
-        List<UpstreamOutcome> outcomes = fireConcurrent(10);
+        List<UpstreamOutcome> outcomes = fireConcurrent(10, 8);
         long succeeded = outcomes.stream().filter(UpstreamOutcome::success).count();
         long degraded = outcomes.stream().filter(UpstreamOutcome::degraded).count();
         log.info("[恢复期并发] 成功(探测)={} 降级(快速失败)={} 触达上游={}",
@@ -107,7 +126,6 @@ class HalfOpenRecoveryTest {
 
         // 探测成功 -> 自动恢复 CLOSED，后续请求正常放行
         assertEquals(CircuitState.CLOSED, breaker.state(KEY));
-        backend.setLatencyMillis(KEY, 0L);
         assertTrue(callOnce().success(), "探测成功后应自动恢复正常放行");
         log.info("[恢复] 熔断器 CLOSED，正常路径恢复");
     }
@@ -116,12 +134,12 @@ class HalfOpenRecoveryTest {
     void failedProbeKeepsIsolation() throws InterruptedException {
         openCircuit();
 
-        // 上游仍未恢复：故障持续，探测将失败
+        // 上游仍未恢复：故障持续，探测将失败；探针先被闸门挡住
         backend.configure(KEY, UpstreamFailureKind.ERROR_5XX, 10);
-        backend.setLatencyMillis(KEY, 300L);
+        backend.blockOnGate();
         clock[0] = 5001L;
 
-        List<UpstreamOutcome> outcomes = fireConcurrent(10);
+        List<UpstreamOutcome> outcomes = fireConcurrent(10, 8);
         long succeeded = outcomes.stream().filter(UpstreamOutcome::success).count();
         long degraded = outcomes.stream().filter(UpstreamOutcome::degraded).count();
         log.info("[探测失败] 成功={} 降级={} 触达上游={}", succeeded, degraded, backend.callCount(KEY));
